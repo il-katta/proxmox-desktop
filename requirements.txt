@@ -1,0 +1,7 @@
+proxmoxer~=2.0.1
+requests~=2.31.0
+openssh_wrapper
+paramiko
+python-xlib
+systemd-python
+xcffib

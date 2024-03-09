@@ -1,0 +1,41 @@
+[Unit]
+Description=proxmox desktop on tty%I
+Wants=graphical.target
+After=graphical.target systemd-user-sessions.service
+# wait for network
+#Wants=network-online.target
+#After=network-online.target
+
+[Service]
+User=user
+WorkingDirectory=~
+PAMName=login
+Environment=XDG_SESSION_TYPE=x11
+TTYPath=/dev/tty%I
+StandardInput=tty
+UnsetEnvironment=TERM
+
+UtmpIdentifier=tty%I
+UtmpMode=user
+
+# this creates /var/log/proxmox-desktop/ directory
+LogsDirectory=proxmox-desktop
+
+StandardOutput=journal
+ExecStartPre=+/usr/bin/chvt %I
+
+#Environment=PYCHARM_DEBUG_HOST=192.168.3.201
+#Environment=PYCHARM_DEBUG_PORT=6543
+
+ExecStart=/usr/local/bin/proxmox-desktop \
+    --vt "%i" \
+    --display ":%i" \
+    --log-file /var/log/proxmox-desktop/%i.log \
+    --config /etc/proxmox-desktop/config.ini
+
+Restart=always
+RestartSec=1
+KillSignal=SIGKILL
+
+[Install]
+WantedBy=graphical.target
