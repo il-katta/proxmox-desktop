@@ -1,9 +1,10 @@
 # Path: proxmox_viewer.py
 import logging
 import os
-import tempfile
-from typing import Optional, List
 import subprocess
+import tempfile
+import time
+from typing import Optional, List
 
 from proxmoxer import ProxmoxAPI
 
@@ -16,13 +17,17 @@ class ProxmoxViewer:
         # remove null value from kwargs
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         self._proxmox = ProxmoxAPI(host=host, service="PVE", backend=backend, **kwargs)
+        self._restart_delay = 5
 
     def remote_viewer(self,
                       vmid: Optional[int] = None,
                       node: Optional[str] = None,
-                      args: Optional[List[str]] = None) -> None:
+                      args: Optional[List[str]] = None,
+                      restart: bool = False) -> None:
+        start_time = time.time()
         if node is None:
             node = self._proxmox.nodes.get()[0]['node']
+        logging.info(f"using node {node}")
         if vmid is None:
             vms = self._proxmox.nodes(node).qemu.get()
             for vm in vms:
@@ -31,77 +36,44 @@ class ProxmoxViewer:
                     break
         if vmid is None:
             raise ValueError("No running VM found")
-
+        logging.info(f"using vmid {vmid}")
         vm_info = self._proxmox.nodes(node).qemu(vmid)
         if vm_info.status.current.get()['status'] != 'running':
             raise ValueError(f"VM {vmid} is not running")
 
         spiceproxy_data = vm_info.spiceproxy.post()
 
-        if self.remote_viewer_path.endswith('spicy'):
-            if args is None:
-                args = []
-            '''
+        tmppath = tempfile.mktemp()
+        with open(tmppath, 'w') as f:
+            f.write("[virt-viewer]\n")
             for k, v in spiceproxy_data.items():
-                if k == 'ca':
-                    tmppath = tempfile.mktemp(suffix='.pem')
-                    with open(tmppath, 'w') as f:
-                        f.write(v)
-                    args.append(f"--spice-ca-file={tmppath}")
-                elif k == 'tls-port':
-                    args.append(f"--secure-port={v}")
-                elif k == 'port':
-                    args.append(f"--port={v}")
-                # elif k == 'host':
-                #    args.append(f"--host={v}")
-                elif k == 'password':
-                    args.append(f"--password={v}")
-                elif k == 'proxy':
-                    args.append(f"--uri={v.replace('http://', 'spice://')}")
-                    # split url in parts, removing protocol
-                    v = v.split('://')[1]
-                    host = v.split(':')[0]
-                    port = v.split(':')[1]
-                    args.append(f"--host={host}")
-                    args.append(f"--port={port}")
-                elif k == 'host-subject':
-                    args.append(f"--spice-host-subject={v}")
-                else:
-                    pass
-            '''
-            options = spiceproxy_data
-            tmppath = tempfile.mktemp(suffix='.pem')
-            with open(tmppath, 'w') as f:
-                lines = options['ca'].split('\\n')
-                for line in lines:
-                    f.write(line + '\n')
-            args.append(f"--spice-ca-file={tmppath}")
-            args.append(f"--secure-port={options['tls-port']}")
-            proxy = options['proxy']
-            proxy = proxy.replace('pve-1.lan', 'pve-1.loopback.it')
-            os.environ['SPICE_PROXY'] = proxy
-            args.append(f"--host={options['host']}")
-            # args.append(f"--port={port}")
-            args.append(f"--spice-host-subject={options['host-subject']}")
-            args.append(f"--password={options['password']}")
+                f.write(f"{k}={v}\n")
+        if args is None:
+            complete_args = []
         else:
-            tmppath = tempfile.mktemp()
-            with open(tmppath, 'w') as f:
-                f.write("[virt-viewer]\n")
-                for k, v in spiceproxy_data.items():
-                    f.write(f"{k}={v}\n")
-            if args is None:
-                args = [
-                    '--spice-debug', '--full-screen',
-                    # '--debug', '--kiosk', '--kiosk-quit=on-disconnect'
-                ]
-            args.append(tmppath)
-        logging.info(f"exec '{self.remote_viewer_path}' {' '.join(args)}")
-        # os.execv(self.remote_viewer_path, args)
-        proc = subprocess.run([self.remote_viewer_path] + args)
-        proc.check_returncode()
-        # proc = subprocess.Popen([self.remote_viewer_path] + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        # proc.wait()
+            complete_args = args[:]
+        args.append(tmppath)
+        logging.info(f"exec '{self.remote_viewer_path}' {' '.join(complete_args)}")
+        try:
+            proc = subprocess.run([self.remote_viewer_path] + complete_args)
+            proc.check_returncode()
+        except subprocess.CalledProcessError:
+            pass
+        finally:
+            if os.path.exists(tmppath):
+                try:
+                    os.remove(tmppath)
+                except Exception:
+                    pass
+
+            if restart:
+                logging.info(f"restarting remote viewer for vm {vmid}")
+                now = time.time()
+                if now - start_time < self._restart_delay:
+                    time.sleep(self._restart_delay - (now - start_time))
+                self.remote_viewer(vmid=vmid, node=node, args=args, restart=restart)
+            else:
+                logging.info(f"remote viewer for vm {vmid} finished")
 
 
 def main():
@@ -126,7 +98,7 @@ def main():
     parser.add_argument('--remote-viewer-path', default='/usr/bin/remote-viewer')
     parser.add_argument('viewer_args', nargs=argparse.ZERO_OR_MORE, default=[
         '--full-screen',
-        '--debug', '--spice-debug',  '--kiosk', '--kiosk-quit=on-disconnect'
+        '--debug', '--spice-debug', '--kiosk', '--kiosk-quit=on-disconnect'
     ])
     cmd_args = parser.parse_args()
     vmid = cmd_args.vmid

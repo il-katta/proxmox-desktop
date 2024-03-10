@@ -5,3 +5,4 @@ __pychache__/
 .venv
 stuff/
 *.log
+config.ini

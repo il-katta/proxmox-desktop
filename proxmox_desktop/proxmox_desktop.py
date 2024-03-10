@@ -8,6 +8,7 @@ import io
 import logging
 import os
 import pprint
+from signal import Signals
 import subprocess
 import threading
 import time
@@ -55,7 +56,7 @@ class MWM(threading.Thread):
 
     _delta_y = 0
 
-    _border = 0
+    _border = -3
 
     def __init__(
             self,
@@ -75,6 +76,10 @@ class MWM(threading.Thread):
             **kwargs,
     ):
         super().__init__()
+        self.main_window = None
+        self.root_gc = None
+        self.screen = None
+        self.gc = None
         logging.basicConfig(
             level=log_level,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -143,24 +148,6 @@ class MWM(threading.Thread):
             f"screen size: {self.screen.width_in_pixels}, {self.screen.height_in_pixels}"
         )
 
-    def run(self):
-        try:
-            self._run()
-        except Exception as e:
-            logging.exception(e)
-
-    def _run(self):
-        try:
-            self.chvt()
-        except Exception as e:
-            logging.error("failed to change vt")
-            logging.exception(e)
-        if not self._no_x:
-            self.run_xorg()
-            # TODO: replace with a function that waits for the X server to start
-            time.sleep(3)
-        self.init()
-
         if not self._no_x:
             logging.info("running X event loop")
             # Tell X server which events we wish to receive for the root window.
@@ -181,26 +168,85 @@ class MWM(threading.Thread):
                     xcffib.xproto.EventMask.Exposure |
                     xcffib.xproto.EventMask.PropertyChange |
                     xcffib.xproto.EventMask.StructureNotify |
-                    xcffib.xproto.EventMask.SubstructureNotify,
+                    xcffib.xproto.EventMask.SubstructureNotify |
+                    xcffib.xproto.EventMask.FocusChange |
+                    xcffib.xproto.EventMask.EnterWindow |
+                    xcffib.xproto.EventMask.LeaveWindow |
+                    xcffib.xproto.EventMask.ButtonPress |
+                    xcffib.xproto.EventMask.ButtonRelease |
+                    xcffib.xproto.EventMask.KeyPress |
+                    xcffib.xproto.EventMask.KeyRelease |
+                    xcffib.xproto.EventMask.PointerMotion
                 ]
             )
             cookie.check()
+
+            screen = self.display.screen()
+            self.root_gc = screen.root.create_gc(
+                foreground=screen.black_pixel,
+                background=screen.white_pixel,
+            )
+
+            self.main_window = screen.root.create_window(
+                x=0, y=0,
+                width=self.screen.width_in_pixels,
+                height=self.screen.height_in_pixels,
+                border_width=0,
+                depth=screen.root_depth,
+                background_pixel=screen.white_pixel,
+                event_mask=Xlib.X.ExposureMask | Xlib.X.KeyPressMask,
+            )
+            self.gc = self.main_window.create_gc(
+                foreground=screen.black_pixel,
+                background=screen.white_pixel,
+            )
+            self.main_window.map()
+
+    def run(self):
+        try:
+            self._run()
+        except Exception as e:
+            logging.exception(e)
+
+    def _run(self):
+        try:
+            self.chvt()
+        except Exception as e:
+            logging.error("failed to change vt")
+            logging.exception(e)
+        if not self._no_x:
+            self.run_xorg()
+            # TODO: replace with a function that waits for the X server to start
+            time.sleep(3)
+        self.init()
+
+        self._write_status("initialization complete. starting apps...")
 
         logging.info("running apps")
         self.run_apps()
 
         logging.info("waiting main process")
+        self._write_status("waiting main process...")
         while self._main_proc is None:
             time.sleep(1)
 
+        self._write_status("connecting ...")
         logging.info("processing events")
+        terminate_event = threading.Event()
+        display_loop = Thread(target=self._display_loop, args=[terminate_event])
+        display_loop.start()
         while event := self.get_event():
             if isinstance(self._main_proc, Thread) and not self._main_proc.is_alive():
+                terminate_event.set()
+                self._write_status("exiting...")
                 logging.info("main process process is terminated")
+                display_loop.join(5)
+                self.display.close()
                 break
 
             if isinstance(event, bool):
                 continue
+
             try:
                 if hasattr(event, 'window'):
                     logging.info(f"X event: {pp.pformat(event)} window: {event.window}")
@@ -244,94 +290,11 @@ class MWM(threading.Thread):
 
                 if isinstance(event, xcffib.xproto.PropertyNotifyEvent):
                     logging.info(
-                        f"X event: PropertyNotifyEvent window: {event.window} state: {event.state} atom: {event.atom} time: {event.time}")
+                        f"X event: PropertyNotifyEvent window: {event.window} state: {event.state} atom: {event.atom} time: {event.time}"
+                    )
 
                 if isinstance(event, xcffib.xproto.ClientMessageEvent):
-
-                    if event.format == 32:
-                        data = event.data.data32
-                    if event.format == 16:
-                        data = event.data.data16
-                    if event.format == 8:
-                        data = event.data.data8
-
-                    logging.info(
-                        f"X event: ClientMessageEvent window: {event.window} format: {event.format} type: {event.type} data: {data}"
-                    )
-                    # check if the event is a _NET_WM_STATE event
-                    if event.type == self._NET_WM_STATE:
-                        # get window property _NET_WM_STATE
-                        current_state = self.conn.core.GetProperty(
-                            False,
-                            event.window,
-                            self._NET_WM_STATE,
-                            xcffib.xproto.Atom.ATOM,
-                            0,
-                            2 ** 32 - 1
-                        ).reply().value.to_atoms()
-                        current_state = set(current_state)
-                        logging.info(f"current state: {current_state}")
-                        action = data[0]
-                        for prop in (data[1], data[2]):
-                            if not prop:
-                                continue
-                            if action == _NET_WM_STATE_REMOVE:
-                                current_state.discard(prop)
-                            elif action == _NET_WM_STATE_ADD:
-                                current_state.add(prop)
-                            elif action == _NET_WM_STATE_TOGGLE:
-                                current_state ^= set([prop])
-
-                            # send
-                            self.conn.core.ChangeProperty(
-                                xcffib.xproto.PropMode.Replace,
-                                event.window,
-                                self._NET_WM_STATE,
-                                xcffib.xproto.Atom.ATOM,
-                                32,
-                                len(current_state),
-                                list(current_state)
-                            )
-                            self.conn.flush()
-
-                    if False:  # event.type == self.??:
-                        logging.info("create window")
-                        new_id = self.conn.generate_id()
-                        r = self.conn.core.CreateWindow(
-                            self.screen.root_depth,
-                            new_id,
-                            event.window,
-                            0,
-                            0,
-                            1,
-                            1,
-                            0,
-                            xcffib.xproto.WindowClass.InputOutput,
-                            0,
-                            xcffib.xproto.CW.EventMask,
-                            [xcffib.xproto.EventMask.StructureNotify]
-                        )
-                        self.conn.core.MapWindow(new_id)
-                        self.conn.flush()
-                        self._windows.add(new_id)
-                        # reply
-                        reply_event = xcffib.xproto.ClientMessageEvent.synthetic(
-                            format=32,
-                            window=event.window,
-                            type=self._NET_WM_STATE,
-                            data=xcffib.xproto.ClientMessageData.synthetic(
-                                [new_id, 0, 0, 0, 0],
-                                "I" * 5
-                            ),
-                        )
-                        self.conn.core.SendEvent(
-                            False,
-                            event.window,
-                            xcffib.xproto.EventMask.NoEvent,
-                            reply_event
-                        )
-                        self.conn.flush()
-
+                    self._handle_client_message_event(event)
 
                 if isinstance(event, xcffib.xproto.FocusInEvent):
                     logging.info(f"X event: FocusInEvent {event.mode}")
@@ -358,6 +321,30 @@ class MWM(threading.Thread):
             except:
                 logging.warning("connection invalidated")
                 break
+
+    def _display_loop(self, terminate_event: threading.Event):
+        while terminate_event.is_set() is False:
+            e = self.display.next_event()
+            logging.info(f"Xlib display event: {e}")
+            if e.type == Xlib.X.Expose:
+                self.main_window.fill_rectangle(gc=self.gc, x=20, y=20, width=10, height=10)
+                self._write_status()
+
+    _status = None
+
+    def _write_status(self, msg: Optional[str] = None):
+        if msg is not None:
+            self._status = msg
+        if self._status is None:
+            self._status = "starting..."
+        self.main_window.clear_area(0, 0, self.screen.width_in_pixels, self.screen.height_in_pixels)
+        self.main_window.draw_text(
+            gc=self.gc,
+            x=int(self.screen.width_in_pixels / 2),
+            y=int(self.screen.height_in_pixels / 2),
+            text=self._status
+        )
+        self.display.flush()
 
     def run_process(self, process_name: str, args: List[str], restart=False) -> Thread:
         thread = Thread(target=self._runprocess, args=[process_name, args, restart])
@@ -410,7 +397,7 @@ class MWM(threading.Thread):
                 "-keeptty",
                 f"vt{self._vt}",
                 # f"tty{self._vt}",
-                "-verbose", "1",
+                "-verbose", "0",
                 # "-once",
                 "-logfile", "/dev/stdout",
             ]
@@ -435,7 +422,8 @@ class MWM(threading.Thread):
                     # '--spice-debug', '--debug',
                     '--kiosk', '--kiosk-quit=on-disconnect',
                     f'--display={self._display}',
-                ]
+                ],
+                False
             ]
         )
         self._main_proc.start()
@@ -638,6 +626,91 @@ class MWM(threading.Thread):
             ]
         )
 
+    def _handle_client_message_event(self, event):
+        if event.format == 32:
+            data = event.data.data32
+        if event.format == 16:
+            data = event.data.data16
+        if event.format == 8:
+            data = event.data.data8
+
+        logging.info(
+            f"X event: ClientMessageEvent window: {event.window} format: {event.format} type: {event.type} data: {data}"
+        )
+        # check if the event is a _NET_WM_STATE event
+        if event.type == self._NET_WM_STATE:
+            # get window property _NET_WM_STATE
+            current_state = self.conn.core.GetProperty(
+                False,
+                event.window,
+                self._NET_WM_STATE,
+                xcffib.xproto.Atom.ATOM,
+                0,
+                2 ** 32 - 1
+            ).reply().value.to_atoms()
+            current_state = set(current_state)
+            logging.info(f"current state: {current_state}")
+            action = data[0]
+            for prop in (data[1], data[2]):
+                if not prop:
+                    continue
+                if action == _NET_WM_STATE_REMOVE:
+                    current_state.discard(prop)
+                elif action == _NET_WM_STATE_ADD:
+                    current_state.add(prop)
+                elif action == _NET_WM_STATE_TOGGLE:
+                    current_state ^= set([prop])
+
+                # send
+                self.conn.core.ChangeProperty(
+                    xcffib.xproto.PropMode.Replace,
+                    event.window,
+                    self._NET_WM_STATE,
+                    xcffib.xproto.Atom.ATOM,
+                    32,
+                    len(current_state),
+                    list(current_state)
+                )
+                self.conn.flush()
+
+        if False:  # event.type == self.??:
+            logging.info("create window")
+            new_id = self.conn.generate_id()
+            r = self.conn.core.CreateWindow(
+                self.screen.root_depth,
+                new_id,
+                event.window,
+                0,
+                0,
+                1,
+                1,
+                0,
+                xcffib.xproto.WindowClass.InputOutput,
+                0,
+                xcffib.xproto.CW.EventMask,
+                [xcffib.xproto.EventMask.StructureNotify]
+            )
+            self.conn.core.MapWindow(new_id)
+            self.conn.flush()
+            self._windows.add(new_id)
+            # reply
+            reply_event = xcffib.xproto.ClientMessageEvent.synthetic(
+                format=32,
+                window=event.window,
+                type=self._NET_WM_STATE,
+                data=xcffib.xproto.ClientMessageData.synthetic(
+                    [new_id, 0, 0, 0, 0],
+                    "I" * 5
+                ),
+            )
+            self.conn.core.SendEvent(
+                False,
+                event.window,
+                xcffib.xproto.EventMask.NoEvent,
+                reply_event
+            )
+            self.conn.flush()
+
     def get_event(self) -> Any | None | bool:
         time.sleep(1)
         try:
@@ -656,7 +729,7 @@ class MWM(threading.Thread):
             return True
 
     def _kill_processes(self):
-        import signal
+
         for process in self._processes:
             try:
                 if process.returncode is not None:
@@ -665,12 +738,16 @@ class MWM(threading.Thread):
                 process.terminate()
                 if process.wait(30) is None:
                     logging.info(f"killing {process.args}")
-                    os.kill(process.pid, signal.Signals.SIGKILL)
+                    os.kill(process.pid, Signals.SIGKILL)
             except Exception as e:
                 logging.exception(e)
 
     def __del__(self):
-        logging.info("exit")
+        if self.display:
+            try:
+                self.display.close()
+            except Exception:
+                pass
         self._kill_processes()
 
     def __enter__(self) -> "MWM":

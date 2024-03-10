@@ -2,6 +2,7 @@
 Description=proxmox desktop on tty%I
 Wants=graphical.target
 After=graphical.target systemd-user-sessions.service
+Conflicts=getty@tty%i.service
 # wait for network
 #Wants=network-online.target
 #After=network-online.target
@@ -21,7 +22,7 @@ UtmpMode=user
 # this creates /var/log/proxmox-desktop/ directory
 LogsDirectory=proxmox-desktop
 
-StandardOutput=journal
+#StandardOutput=journal
 ExecStartPre=+/usr/bin/chvt %I
 
 #Environment=PYCHARM_DEBUG_HOST=192.168.3.201
@@ -33,7 +34,7 @@ ExecStart=/usr/local/bin/proxmox-desktop \
     --log-file /var/log/proxmox-desktop/%i.log \
     --config /etc/proxmox-desktop/config.ini
 
-Restart=always
+#Restart=always
 RestartSec=1
 KillSignal=SIGKILL
 
